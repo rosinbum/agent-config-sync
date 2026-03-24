@@ -1,0 +1,1062 @@
+#!/usr/bin/env bash
+# acs — agent-config-sync
+# Sync Claude Code configuration across machines and accounts.
+#
+# Usage: acs <command> [options]
+# Commands: init, bootstrap, install, capture, status, push, pull, diff, help
+
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# ================================================================
+# LIB: Shared functions
+# ================================================================
+
+CLAUDE_DIR="${HOME}/.claude"
+CONFIG_DIR=""  # resolved per invocation
+
+# Artifact types
+SYMLINK_DIRS=(commands skills agents rules)
+SYMLINK_FILES=(statusline-command.sh keybindings.json)
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+log_info()    { printf "${BLUE}[info]${NC} %s\n" "$1"; }
+log_success() { printf "${GREEN}[ok]${NC} %s\n" "$1"; }
+log_warn()    { printf "${YELLOW}[warn]${NC} %s\n" "$1"; }
+log_error()   { printf "${RED}[error]${NC} %s\n" "$1" >&2; }
+log_header()  { printf "\n${BOLD}%s${NC}\n" "$1"; }
+
+# --- Config dir resolution ---
+
+# Find the config directory by looking for .acs marker
+find_config_dir() {
+  # Explicit --dir flag takes precedence (set in CONFIG_DIR before calling)
+  if [[ -n "$CONFIG_DIR" ]] && [[ -f "${CONFIG_DIR}/.acs" ]]; then
+    return 0
+  fi
+
+  # Check ACS_CONFIG_DIR env var
+  if [[ -n "${ACS_CONFIG_DIR:-}" ]] && [[ -f "${ACS_CONFIG_DIR}/.acs" ]]; then
+    CONFIG_DIR="$ACS_CONFIG_DIR"
+    return 0
+  fi
+
+  # Walk up from current directory
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "${dir}/.acs" ]]; then
+      CONFIG_DIR="$dir"
+      return 0
+    fi
+    dir=$(dirname "$dir")
+  done
+
+  return 1
+}
+
+require_config_dir() {
+  if ! find_config_dir; then
+    log_error "Not in a config repo. Run 'acs init <directory>' first,"
+    log_error "or set ACS_CONFIG_DIR, or use --dir <path>."
+    exit 1
+  fi
+}
+
+# --- Profile helpers ---
+
+get_active_profile() {
+  local pfile="${CONFIG_DIR}/.profile"
+  if [[ -f "$pfile" ]]; then
+    cat "$pfile"
+  else
+    echo ""
+  fi
+}
+
+set_active_profile() {
+  echo "$1" > "${CONFIG_DIR}/.profile"
+}
+
+get_profile_dir() {
+  echo "${CONFIG_DIR}/profiles/${1}"
+}
+
+list_profiles() {
+  if [[ -d "${CONFIG_DIR}/profiles" ]]; then
+    for dir in "${CONFIG_DIR}/profiles"/*/; do
+      [[ -d "$dir" ]] && basename "$dir"
+    done
+  fi
+}
+
+# --- Path scrubbing ---
+
+scrub_paths() {
+  printf '%s' "$1" | sed "s|${HOME}|{{ HOME }}|g"
+}
+
+expand_paths() {
+  printf '%s' "$1" | sed "s|{{ HOME }}|${HOME}|g"
+}
+
+scrub_file() {
+  local content
+  content=$(cat "$1")
+  printf '%s\n' "$(scrub_paths "$content")" > "$1"
+}
+
+# --- Checksum ---
+
+file_checksum() {
+  if [[ -f "$1" ]]; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    echo ""
+  fi
+}
+
+# --- Manifest (state tracking for copy-managed files) ---
+
+ensure_state_dir() {
+  mkdir -p "${CONFIG_DIR}/.state"
+  if [[ ! -f "${CONFIG_DIR}/.state/manifest.json" ]]; then
+    echo '{}' > "${CONFIG_DIR}/.state/manifest.json"
+  fi
+}
+
+manifest_get() {
+  local mf="${CONFIG_DIR}/.state/manifest.json"
+  local key="$1" field="${2:-}"
+  /usr/bin/python3 -c "
+import json
+with open('${mf}') as f:
+    d = json.load(f)
+entry = d.get('$key', {})
+if '$field':
+    print(entry.get('$field', ''))
+else:
+    print(json.dumps(entry))
+" 2>/dev/null || echo ""
+}
+
+manifest_set() {
+  local mf="${CONFIG_DIR}/.state/manifest.json"
+  local key="$1" source="$2" type="$3" checksum="$4"
+  /usr/bin/python3 -c "
+import json
+try:
+    with open('${mf}') as f:
+        d = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    d = {}
+d['$key'] = {'source': '$source', 'type': '$type', 'checksum': '$checksum'}
+with open('${mf}', 'w') as f:
+    json.dump(d, f, indent=2)
+    f.write('\n')
+"
+}
+
+# --- Backup ---
+
+backup_file() {
+  if [[ -e "$1" ]] && [[ ! -L "$1" ]]; then
+    local bdir="${CLAUDE_DIR}/backups/config-sync"
+    mkdir -p "$bdir"
+    local ts
+    ts=$(date +%Y%m%d-%H%M%S)
+    cp "$1" "${bdir}/$(basename "$1").${ts}.bak"
+    log_info "Backed up $(basename "$1") → backups/config-sync/"
+  fi
+}
+
+# --- Symlink helpers ---
+
+is_our_symlink() {
+  if [[ -L "$1" ]]; then
+    local dest
+    dest=$(readlink "$1")
+    [[ "$dest" == "${CONFIG_DIR}"* ]] && return 0
+  fi
+  return 1
+}
+
+create_symlink() {
+  local source="$1" target="$2" dry_run="${3:-false}"
+  [[ ! -e "$source" ]] && { log_warn "Source missing: ${source}"; return 1; }
+
+  if [[ -L "$target" ]]; then
+    local existing
+    existing=$(readlink "$target")
+    if [[ "$existing" == "$source" ]]; then
+      [[ "$dry_run" == "true" ]] && log_success "[dry-run] Already linked: $(basename "$target")"
+      return 0
+    fi
+    [[ "$dry_run" == "true" ]] && { log_warn "[dry-run] Would relink: $(basename "$target")"; return 0; }
+    rm "$target"
+  elif [[ -e "$target" ]]; then
+    [[ "$dry_run" == "true" ]] && { log_warn "[dry-run] Would backup+replace: $(basename "$target")"; return 0; }
+    backup_file "$target"
+    rm "$target"
+  else
+    [[ "$dry_run" == "true" ]] && { log_info "[dry-run] Would link: $(basename "$target")"; return 0; }
+  fi
+
+  mkdir -p "$(dirname "$target")"
+  ln -s "$source" "$target"
+  log_success "Linked: $(basename "$target")"
+}
+
+install_copy() {
+  local source="$1" target="$2" mkey="$3" msource="$4" dry_run="${5:-false}" force="${6:-false}"
+  [[ ! -f "$source" ]] && return 0
+
+  local expanded
+  expanded=$(expand_paths "$(cat "$source")")
+
+  if [[ "$dry_run" == "true" ]]; then
+    if [[ -f "$target" ]]; then
+      [[ "$(cat "$target")" == "$expanded" ]] && log_success "[dry-run] Up to date: $(basename "$target")" || log_warn "[dry-run] Would update: $(basename "$target")"
+    else
+      log_info "[dry-run] Would create: $(basename "$target")"
+    fi
+    return 0
+  fi
+
+  if [[ -f "$target" ]] && [[ ! -L "$target" ]]; then
+    if [[ "$(cat "$target")" == "$expanded" ]]; then
+      manifest_set "$mkey" "$msource" "copy" "$(file_checksum "$target")"
+      return 0
+    fi
+    local rec
+    rec=$(manifest_get "$mkey" "checksum")
+    local cur
+    cur=$(file_checksum "$target")
+    if [[ -n "$rec" ]] && [[ "$cur" != "$rec" ]] && [[ "$force" != "true" ]]; then
+      log_warn "$(basename "$target") has local changes. Run 'acs capture' first, or use --force."
+      return 0
+    fi
+    backup_file "$target"
+  fi
+
+  [[ -L "$target" ]] && rm "$target"
+  mkdir -p "$(dirname "$target")"
+  printf '%s\n' "$expanded" > "$target"
+  manifest_set "$mkey" "$msource" "copy" "$(file_checksum "$target")"
+  log_success "Installed: $(basename "$target")"
+}
+
+# ================================================================
+# COMMAND: init
+# ================================================================
+
+cmd_init() {
+  local dir="${1:-}"
+  local profile="${2:-}"
+
+  if [[ -z "$dir" ]]; then
+    echo "Usage: acs init <directory> [profile]"
+    echo ""
+    echo "Creates a new config repo with the base/profiles directory structure."
+    echo "If profile is given, creates that profile directory too."
+    exit 1
+  fi
+
+  # Resolve to absolute path
+  if [[ "$dir" != /* ]]; then
+    dir="$PWD/$dir"
+  fi
+
+  if [[ -f "${dir}/.acs" ]]; then
+    log_warn "Already initialized: ${dir}"
+    return 0
+  fi
+
+  log_header "Initializing config repo at ${dir}"
+  mkdir -p "${dir}/base"/{commands,skills,agents,rules}
+
+  if [[ -n "$profile" ]]; then
+    mkdir -p "${dir}/profiles/${profile}"/{commands,skills,agents,rules}
+    log_success "Created profile: ${profile}"
+  fi
+
+  # Marker file
+  echo "version: ${VERSION}" > "${dir}/.acs"
+
+  # .gitignore
+  cat > "${dir}/.gitignore" << 'GITIGNORE'
+# Machine-specific state
+.profile
+.state/
+
+# Backup files
+*.local-backup
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
+GITIGNORE
+
+  # Init git if not already
+  if [[ ! -d "${dir}/.git" ]]; then
+    git -C "$dir" init -q
+    log_success "Initialized git repo"
+  fi
+
+  log_success "Config repo created at ${dir}"
+  echo ""
+  echo "Next steps:"
+  echo "  cd ${dir}"
+  echo "  acs bootstrap ${profile}"
+  echo "  acs install ${profile}"
+}
+
+# ================================================================
+# COMMAND: bootstrap
+# ================================================================
+
+cmd_bootstrap() {
+  require_config_dir
+  local profile="${1:-}"
+
+  if [[ -n "$profile" ]]; then
+    log_header "Bootstrapping into base/ + profiles/${profile}/"
+    mkdir -p "${CONFIG_DIR}/profiles/${profile}"/{commands,skills,agents,rules}
+  else
+    log_header "Bootstrapping into base/ (no profile)"
+  fi
+
+  [[ ! -d "$CLAUDE_DIR" ]] && { log_error "~/.claude/ does not exist."; exit 1; }
+
+  mkdir -p "${CONFIG_DIR}/base"/{commands,skills,agents,rules}
+
+  # settings.json
+  if [[ -f "${CLAUDE_DIR}/settings.json" ]]; then
+    scrub_paths "$(cat "${CLAUDE_DIR}/settings.json")" > "${CONFIG_DIR}/base/settings.json"
+    echo "" >> "${CONFIG_DIR}/base/settings.json"
+    log_success "Imported settings.json → base/"
+  fi
+
+  # settings.local.json → profile
+  if [[ -f "${CLAUDE_DIR}/settings.local.json" ]]; then
+    if [[ -n "$profile" ]]; then
+      scrub_paths "$(cat "${CLAUDE_DIR}/settings.local.json")" > "${CONFIG_DIR}/profiles/${profile}/settings.local.json"
+      echo "" >> "${CONFIG_DIR}/profiles/${profile}/settings.local.json"
+      log_success "Imported settings.local.json → profiles/${profile}/"
+    else
+      log_warn "settings.local.json exists but no profile specified — skipping"
+    fi
+  fi
+
+  # CLAUDE.md
+  if [[ -f "${CLAUDE_DIR}/CLAUDE.md" ]]; then
+    scrub_paths "$(cat "${CLAUDE_DIR}/CLAUDE.md")" > "${CONFIG_DIR}/base/CLAUDE.md"
+    log_success "Imported CLAUDE.md → base/"
+  fi
+
+  # Directory artifacts
+  for dir in "${SYMLINK_DIRS[@]}"; do
+    local src_dir="${CLAUDE_DIR}/${dir}"
+    local dst_dir="${CONFIG_DIR}/base/${dir}"
+    [[ ! -d "$src_dir" ]] && continue
+
+    local count=0
+    while IFS= read -r -d '' file; do
+      local rel="${file#${src_dir}/}"
+      local dst="${dst_dir}/${rel}"
+      mkdir -p "$(dirname "$dst")"
+      cp "$file" "$dst"
+      scrub_file "$dst"
+      count=$((count + 1))
+    done < <(find "$src_dir" -type f -print0 2>/dev/null)
+
+    [[ $count -gt 0 ]] && log_success "Imported ${count} file(s) from ${dir}/ → base/${dir}/"
+  done
+
+  # Single files
+  for file in "${SYMLINK_FILES[@]}"; do
+    if [[ -f "${CLAUDE_DIR}/${file}" ]]; then
+      cp "${CLAUDE_DIR}/${file}" "${CONFIG_DIR}/base/${file}"
+      scrub_file "${CONFIG_DIR}/base/${file}"
+      log_success "Imported ${file} → base/"
+    fi
+  done
+
+  log_header "Bootstrap complete"
+  echo ""
+  echo "Next: acs install ${profile}"
+}
+
+# ================================================================
+# COMMAND: install
+# ================================================================
+
+cmd_install() {
+  require_config_dir
+
+  local dry_run=false force=false profile=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=true; shift ;;
+      --force)   force=true; shift ;;
+      --list)    list_profiles; exit 0 ;;
+      -*)        log_error "Unknown option: $1"; exit 1 ;;
+      *)         profile="$1"; shift ;;
+    esac
+  done
+
+  [[ -z "$profile" ]] && profile=$(get_active_profile)
+  local profile_dir=""
+  if [[ -n "$profile" ]]; then
+    profile_dir=$(get_profile_dir "$profile")
+    if [[ ! -d "$profile_dir" ]]; then
+      log_error "Profile '${profile}' not found. Available: $(list_profiles | tr '\n' ' ')"
+      exit 1
+    fi
+  fi
+
+  ensure_state_dir
+  mkdir -p "$CLAUDE_DIR"
+
+  log_header "Installing config → ~/.claude/"
+  [[ -n "$profile" ]] && log_info "Profile: ${profile}"
+  [[ "$dry_run" == "true" ]] && log_info "Mode: dry-run"
+
+  # Clean up old profile if switching
+  local old_profile
+  old_profile=$(get_active_profile)
+  if [[ -n "$old_profile" ]] && [[ -n "$profile" ]] && [[ "$old_profile" != "$profile" ]] && [[ "$dry_run" != "true" ]]; then
+    log_info "Switching: ${old_profile} → ${profile}"
+    local old_dir
+    old_dir=$(get_profile_dir "$old_profile")
+
+    for d in "${SYMLINK_DIRS[@]}"; do
+      [[ ! -d "${old_dir}/${d}" ]] && continue
+      while IFS= read -r -d '' old_src; do
+        local rel="${old_src#${old_dir}/${d}/}"
+        local dst="${CLAUDE_DIR}/${d}/${rel}"
+        if [[ -L "$dst" ]] && [[ "$(readlink "$dst")" == "$old_src" ]]; then
+          rm "$dst"
+          local base_v="${CONFIG_DIR}/base/${d}/${rel}"
+          [[ -f "$base_v" ]] && ln -s "$base_v" "$dst"
+        fi
+      done < <(find "${old_dir}/${d}" -type f -print0 2>/dev/null)
+    done
+
+    for f in "${SYMLINK_FILES[@]}"; do
+      local dst="${CLAUDE_DIR}/${f}"
+      if [[ -L "$dst" ]] && [[ "$(readlink "$dst")" == "${old_dir}/${f}" ]]; then
+        rm "$dst"
+        [[ -f "${CONFIG_DIR}/base/${f}" ]] && ln -s "${CONFIG_DIR}/base/${f}" "$dst"
+      fi
+    done
+
+    [[ -f "${CLAUDE_DIR}/settings.local.json" ]] && rm "${CLAUDE_DIR}/settings.local.json"
+  fi
+
+  # Symlink single files from base/
+  log_header "Single files (base)"
+  for file in "${SYMLINK_FILES[@]}"; do
+    [[ -f "${CONFIG_DIR}/base/${file}" ]] && create_symlink "${CONFIG_DIR}/base/${file}" "${CLAUDE_DIR}/${file}" "$dry_run"
+  done
+
+  # Symlink directory contents from base/
+  for dir in "${SYMLINK_DIRS[@]}"; do
+    local src_dir="${CONFIG_DIR}/base/${dir}"
+    [[ ! -d "$src_dir" ]] && continue
+    local count
+    count=$(find "$src_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$count" -eq 0 ]] && continue
+
+    log_header "${dir}/ (base)"
+    mkdir -p "${CLAUDE_DIR}/${dir}"
+    while IFS= read -r -d '' src; do
+      local rel="${src#${src_dir}/}"
+      mkdir -p "$(dirname "${CLAUDE_DIR}/${dir}/${rel}")"
+      create_symlink "$src" "${CLAUDE_DIR}/${dir}/${rel}" "$dry_run"
+    done < <(find "$src_dir" -type f -print0 2>/dev/null)
+  done
+
+  # settings.json (copy with path expansion)
+  log_header "Settings"
+  install_copy "${CONFIG_DIR}/base/settings.json" "${CLAUDE_DIR}/settings.json" "settings.json" "base" "$dry_run" "$force"
+
+  # CLAUDE.md (concatenation of base + profile)
+  local claude_md_base="${CONFIG_DIR}/base/CLAUDE.md"
+  if [[ -f "$claude_md_base" ]]; then
+    log_header "CLAUDE.md"
+    local combined
+    combined=$(expand_paths "$(cat "$claude_md_base")")
+
+    if [[ -n "$profile" ]] && [[ -f "${profile_dir}/CLAUDE.md" ]]; then
+      combined="${combined}
+
+<!-- profile: ${profile} -->
+
+$(expand_paths "$(cat "${profile_dir}/CLAUDE.md")")"
+    fi
+
+    local claude_dst="${CLAUDE_DIR}/CLAUDE.md"
+    if [[ "$dry_run" == "true" ]]; then
+      if [[ -f "$claude_dst" ]] && [[ "$(cat "$claude_dst")" == "$combined" ]]; then
+        log_success "[dry-run] CLAUDE.md is up to date"
+      else
+        log_warn "[dry-run] Would update CLAUDE.md"
+      fi
+    else
+      if [[ -f "$claude_dst" ]] && [[ ! -L "$claude_dst" ]]; then
+        local cur_cs rec_cs
+        cur_cs=$(file_checksum "$claude_dst")
+        rec_cs=$(manifest_get "CLAUDE.md" "checksum")
+        if [[ -n "$rec_cs" ]] && [[ "$cur_cs" != "$rec_cs" ]] && [[ "$force" != "true" ]]; then
+          log_warn "CLAUDE.md has local changes. Run 'acs capture' first, or use --force."
+        else
+          backup_file "$claude_dst"
+          printf '%s\n' "$combined" > "$claude_dst"
+          manifest_set "CLAUDE.md" "merged" "copy" "$(file_checksum "$claude_dst")"
+          log_success "Installed CLAUDE.md"
+        fi
+      else
+        [[ -L "$claude_dst" ]] && rm "$claude_dst"
+        printf '%s\n' "$combined" > "$claude_dst"
+        manifest_set "CLAUDE.md" "merged" "copy" "$(file_checksum "$claude_dst")"
+        log_success "Installed CLAUDE.md"
+      fi
+    fi
+  fi
+
+  # Profile overlays
+  if [[ -n "$profile" ]] && [[ -n "$profile_dir" ]]; then
+    install_copy "${profile_dir}/settings.local.json" "${CLAUDE_DIR}/settings.local.json" "settings.local.json" "profile:${profile}" "$dry_run" "$force"
+
+    for dir in "${SYMLINK_DIRS[@]}"; do
+      local p_src="${profile_dir}/${dir}"
+      [[ ! -d "$p_src" ]] && continue
+      local count
+      count=$(find "$p_src" -type f 2>/dev/null | wc -l | tr -d ' ')
+      [[ "$count" -eq 0 ]] && continue
+
+      log_header "${dir}/ (profile: ${profile})"
+      mkdir -p "${CLAUDE_DIR}/${dir}"
+      while IFS= read -r -d '' src; do
+        local rel="${src#${p_src}/}"
+        local dst="${CLAUDE_DIR}/${dir}/${rel}"
+        local base_v="${CONFIG_DIR}/base/${dir}/${rel}"
+        if [[ -f "$base_v" ]] && [[ -L "$dst" ]] && [[ "$(readlink "$dst")" == "$base_v" ]]; then
+          [[ "$dry_run" != "true" ]] && { rm "$dst"; log_warn "Profile overrides base: ${dir}/${rel}"; } || log_warn "[dry-run] Profile overrides base: ${dir}/${rel}"
+        fi
+        mkdir -p "$(dirname "$dst")"
+        create_symlink "$src" "$dst" "$dry_run"
+      done < <(find "$p_src" -type f -print0 2>/dev/null)
+    done
+
+    for file in "${SYMLINK_FILES[@]}"; do
+      if [[ -f "${profile_dir}/${file}" ]]; then
+        local dst="${CLAUDE_DIR}/${file}"
+        if [[ "$dry_run" != "true" ]]; then
+          [[ -L "$dst" ]] && rm "$dst"
+          log_warn "Profile overrides base: ${file}"
+        fi
+        create_symlink "${profile_dir}/${file}" "$dst" "$dry_run"
+      fi
+    done
+
+    [[ "$dry_run" != "true" ]] && set_active_profile "$profile"
+  fi
+
+  log_header "Done"
+  [[ "$dry_run" == "true" ]] && log_info "Dry run — no changes made." || log_success "Configuration installed to ~/.claude/"
+}
+
+# ================================================================
+# COMMAND: capture
+# ================================================================
+
+cmd_capture() {
+  require_config_dir
+
+  local dry_run=false target="base"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)    dry_run=true; shift ;;
+      --to-base)    target="base"; shift ;;
+      --to-profile) target="profile"; shift ;;
+      -*)           log_error "Unknown option: $1"; exit 1 ;;
+      *)            log_error "Unknown argument: $1"; exit 1 ;;
+    esac
+  done
+
+  local profile
+  profile=$(get_active_profile)
+  if [[ "$target" == "profile" ]] && [[ -z "$profile" ]]; then
+    log_error "No active profile. Use --to-base or run 'acs install <profile>' first."
+    exit 1
+  fi
+
+  ensure_state_dir
+  local changes=0
+
+  log_header "Scanning ~/.claude/ for changes"
+
+  # 1. settings.json
+  local sdst="${CLAUDE_DIR}/settings.json"
+  if [[ -f "$sdst" ]] && [[ ! -L "$sdst" ]]; then
+    local cur rec
+    cur=$(file_checksum "$sdst")
+    rec=$(manifest_get "settings.json" "checksum")
+    if [[ -n "$rec" ]] && [[ "$cur" != "$rec" ]]; then
+      changes=1
+      if [[ "$dry_run" == "true" ]]; then
+        log_warn "[dry-run] settings.json modified"
+      else
+        log_info "Capturing settings.json..."
+        scrub_paths "$(cat "$sdst")" > "${CONFIG_DIR}/base/settings.json"
+        echo "" >> "${CONFIG_DIR}/base/settings.json"
+        manifest_set "settings.json" "base" "copy" "$cur"
+        log_success "Captured settings.json → base/"
+      fi
+    fi
+  fi
+
+  # 2. settings.local.json
+  if [[ -n "$profile" ]]; then
+    local sldst="${CLAUDE_DIR}/settings.local.json"
+    local slsrc="${CONFIG_DIR}/profiles/${profile}/settings.local.json"
+    if [[ -f "$sldst" ]] && [[ ! -L "$sldst" ]]; then
+      local cur rec
+      cur=$(file_checksum "$sldst")
+      rec=$(manifest_get "settings.local.json" "checksum")
+      if [[ -n "$rec" ]] && [[ "$cur" != "$rec" ]]; then
+        changes=1
+        if [[ "$dry_run" == "true" ]]; then
+          log_warn "[dry-run] settings.local.json modified"
+        else
+          mkdir -p "$(dirname "$slsrc")"
+          scrub_paths "$(cat "$sldst")" > "$slsrc"
+          echo "" >> "$slsrc"
+          manifest_set "settings.local.json" "profile:${profile}" "copy" "$cur"
+          log_success "Captured settings.local.json → profiles/${profile}/"
+        fi
+      elif [[ -z "$rec" ]] && [[ ! -f "$slsrc" ]]; then
+        changes=1
+        if [[ "$dry_run" == "true" ]]; then
+          log_warn "[dry-run] New settings.local.json detected"
+        else
+          mkdir -p "$(dirname "$slsrc")"
+          scrub_paths "$(cat "$sldst")" > "$slsrc"
+          echo "" >> "$slsrc"
+          manifest_set "settings.local.json" "profile:${profile}" "copy" "$(file_checksum "$sldst")"
+          log_success "Captured new settings.local.json → profiles/${profile}/"
+        fi
+      fi
+    fi
+  fi
+
+  # 3. New artifacts in symlinked directories
+  for dir in "${SYMLINK_DIRS[@]}"; do
+    local dstd="${CLAUDE_DIR}/${dir}"
+    [[ ! -d "$dstd" ]] && continue
+
+    while IFS= read -r -d '' file; do
+      local rel="${file#${dstd}/}"
+      [[ "$rel" == .* ]] && continue
+      changes=1
+
+      local dest_base dest_dir
+      if [[ "$target" == "profile" ]] && [[ -n "$profile" ]]; then
+        dest_base="profiles/${profile}"
+        dest_dir="${CONFIG_DIR}/profiles/${profile}/${dir}"
+      else
+        dest_base="base"
+        dest_dir="${CONFIG_DIR}/base/${dir}"
+      fi
+
+      if [[ "$dry_run" == "true" ]]; then
+        log_warn "[dry-run] New: ${dir}/${rel} → ${dest_base}/${dir}/"
+      else
+        local dest_file="${dest_dir}/${rel}"
+        mkdir -p "$(dirname "$dest_file")"
+        cp "$file" "$dest_file"
+        scrub_file "$dest_file"
+        rm "$file"
+        ln -s "$dest_file" "$file"
+        log_success "Captured ${dir}/${rel} → ${dest_base}/${dir}/"
+      fi
+    done < <(find "$dstd" -type f -not -type l -print0 2>/dev/null)
+  done
+
+  # 4. New single files
+  for file in "${SYMLINK_FILES[@]}"; do
+    local dst="${CLAUDE_DIR}/${file}"
+    if [[ -f "$dst" ]] && [[ ! -L "$dst" ]]; then
+      changes=1
+      local dest_base dest
+      if [[ "$target" == "profile" ]] && [[ -n "$profile" ]]; then
+        dest_base="profiles/${profile}"
+        dest="${CONFIG_DIR}/profiles/${profile}/${file}"
+      else
+        dest_base="base"
+        dest="${CONFIG_DIR}/base/${file}"
+      fi
+
+      if [[ "$dry_run" == "true" ]]; then
+        log_warn "[dry-run] Untracked: ${file} → ${dest_base}/"
+      else
+        mkdir -p "$(dirname "$dest")"
+        cp "$dst" "$dest"
+        scrub_file "$dest"
+        rm "$dst"
+        ln -s "$dest" "$dst"
+        log_success "Captured ${file} → ${dest_base}/"
+      fi
+    fi
+  done
+
+  # 5. CLAUDE.md decomposition
+  local claude_dst="${CLAUDE_DIR}/CLAUDE.md"
+  if [[ -f "$claude_dst" ]] && [[ ! -L "$claude_dst" ]]; then
+    local cur rec
+    cur=$(file_checksum "$claude_dst")
+    rec=$(manifest_get "CLAUDE.md" "checksum")
+    if [[ -n "$rec" ]] && [[ "$cur" != "$rec" ]]; then
+      changes=1
+      if [[ "$dry_run" == "true" ]]; then
+        log_warn "[dry-run] CLAUDE.md modified"
+      else
+        local content
+        content=$(cat "$claude_dst")
+        if [[ -n "$profile" ]] && echo "$content" | grep -q "<!-- profile: ${profile} -->"; then
+          local base_content profile_content
+          base_content=$(echo "$content" | sed "/<!-- profile: ${profile} -->/,\$d" | sed 's/[[:space:]]*$//')
+          profile_content=$(echo "$content" | sed -n "/<!-- profile: ${profile} -->/,\$p" | tail -n +2 | sed '/./,$!d')
+          scrub_paths "$base_content" > "${CONFIG_DIR}/base/CLAUDE.md"
+          echo "" >> "${CONFIG_DIR}/base/CLAUDE.md"
+          if [[ -n "${profile_content// /}" ]]; then
+            local pdir
+            pdir=$(get_profile_dir "$profile")
+            mkdir -p "$pdir"
+            scrub_paths "$profile_content" > "${pdir}/CLAUDE.md"
+            echo "" >> "${pdir}/CLAUDE.md"
+            log_success "Decomposed CLAUDE.md → base + profiles/${profile}/"
+          else
+            log_success "Captured CLAUDE.md → base/"
+          fi
+        else
+          scrub_paths "$content" > "${CONFIG_DIR}/base/CLAUDE.md"
+          echo "" >> "${CONFIG_DIR}/base/CLAUDE.md"
+          log_success "Captured CLAUDE.md → base/"
+        fi
+        manifest_set "CLAUDE.md" "merged" "copy" "$cur"
+      fi
+    fi
+  fi
+
+  # 6. Dangling symlinks
+  local dangling=0
+  for dir in "${SYMLINK_DIRS[@]}"; do
+    local dstd="${CLAUDE_DIR}/${dir}"
+    [[ ! -d "$dstd" ]] && continue
+    while IFS= read -r -d '' link; do
+      if is_our_symlink "$link" && [[ ! -e "$link" ]]; then
+        dangling=$((dangling + 1))
+        [[ "$dry_run" == "true" ]] && log_warn "[dry-run] Dangling: $(basename "$link")" || { rm "$link"; log_warn "Removed dangling: $(basename "$link")"; }
+      fi
+    done < <(find "$dstd" -type l -print0 2>/dev/null)
+  done
+  for file in "${SYMLINK_FILES[@]}"; do
+    local dst="${CLAUDE_DIR}/${file}"
+    if is_our_symlink "$dst" && [[ ! -e "$dst" ]]; then
+      dangling=$((dangling + 1))
+      [[ "$dry_run" == "true" ]] && log_warn "[dry-run] Dangling: ${file}" || { rm "$dst"; log_warn "Removed dangling: ${file}"; }
+    fi
+  done
+
+  echo ""
+  if [[ "$changes" -eq 0 ]] && [[ "$dangling" -eq 0 ]]; then
+    log_success "Everything in sync."
+  elif [[ "$dry_run" == "true" ]]; then
+    log_info "Dry run. Use without --dry-run to apply."
+  else
+    log_success "Capture complete."
+    log_info "Review: cd ${CONFIG_DIR} && git diff"
+  fi
+}
+
+# ================================================================
+# COMMAND: status
+# ================================================================
+
+cmd_status() {
+  require_config_dir
+  local profile
+  profile=$(get_active_profile)
+  local profile_dir=""
+  [[ -n "$profile" ]] && profile_dir=$(get_profile_dir "$profile")
+
+  ensure_state_dir
+
+  printf "${BOLD}=== Claude Config Sync ===${NC}\n"
+  echo "Config:  ${CONFIG_DIR}"
+  echo "Target:  ${CLAUDE_DIR}"
+  echo "Profile: ${profile:-<none>}"
+  echo ""
+
+  # Directory artifacts
+  for dir in "${SYMLINK_DIRS[@]}"; do
+    local base_dir="${CONFIG_DIR}/base/${dir}"
+    local p_dir=""
+    [[ -n "$profile_dir" ]] && p_dir="${profile_dir}/${dir}"
+    local dst_dir="${CLAUDE_DIR}/${dir}"
+    local has_items=false
+
+    if [[ -d "$base_dir" ]]; then
+      while IFS= read -r -d '' src; do
+        has_items=true
+        local rel="${src#${base_dir}/}"
+        local dst="${dst_dir}/${rel}"
+        if [[ -L "$dst" ]]; then
+          local lt
+          lt=$(readlink "$dst")
+          if [[ "$lt" == "$src" ]]; then
+            printf "  ${GREEN}synced${NC}    %-10s %s\n" "[base]" "${dir}/${rel}"
+          elif [[ -n "$p_dir" ]] && [[ "$lt" == "${p_dir}/${rel}" ]]; then
+            printf "  ${CYAN}override${NC}  %-10s %s\n" "[profile]" "${dir}/${rel}"
+          else
+            printf "  ${YELLOW}external${NC}  %-10s %s\n" "" "${dir}/${rel}"
+          fi
+        elif [[ -f "$dst" ]]; then
+          printf "  ${YELLOW}local${NC}     %-10s %s\n" "" "${dir}/${rel}"
+        else
+          printf "  ${RED}missing${NC}   %-10s %s\n" "[base]" "${dir}/${rel}"
+        fi
+      done < <(find "$base_dir" -type f -print0 2>/dev/null)
+    fi
+
+    if [[ -n "$p_dir" ]] && [[ -d "$p_dir" ]]; then
+      while IFS= read -r -d '' src; do
+        local rel="${src#${p_dir}/}"
+        [[ -f "${base_dir}/${rel}" ]] && continue
+        has_items=true
+        local dst="${dst_dir}/${rel}"
+        if [[ -L "$dst" ]] && [[ "$(readlink "$dst")" == "$src" ]]; then
+          printf "  ${GREEN}synced${NC}    %-10s %s\n" "[profile]" "${dir}/${rel}"
+        else
+          printf "  ${RED}missing${NC}   %-10s %s\n" "[profile]" "${dir}/${rel}"
+        fi
+      done < <(find "$p_dir" -type f -print0 2>/dev/null)
+    fi
+
+    if [[ -d "$dst_dir" ]]; then
+      while IFS= read -r -d '' file; do
+        local rel="${file#${dst_dir}/}"
+        [[ "$rel" == .* ]] && continue
+        has_items=true
+        printf "  ${YELLOW}new${NC}       %-10s %s\n" "[local]" "${dir}/${rel}"
+      done < <(find "$dst_dir" -type f -not -type l -print0 2>/dev/null)
+    fi
+
+    [[ "$has_items" == "true" ]] && echo ""
+  done
+
+  # Single symlinked files
+  for file in "${SYMLINK_FILES[@]}"; do
+    local dst="${CLAUDE_DIR}/${file}"
+    if [[ -L "$dst" ]]; then
+      local lt
+      lt=$(readlink "$dst")
+      if [[ "$lt" == "${CONFIG_DIR}/base/${file}" ]]; then
+        printf "  ${GREEN}synced${NC}    %-10s %s\n" "[base]" "$file"
+      elif [[ -n "$profile_dir" ]] && [[ "$lt" == "${profile_dir}/${file}" ]]; then
+        printf "  ${GREEN}synced${NC}    %-10s %s\n" "[profile]" "$file"
+      elif [[ "$lt" == "${CONFIG_DIR}"* ]]; then
+        printf "  ${GREEN}synced${NC}    %-10s %s\n" "[repo]" "$file"
+      fi
+    elif [[ -f "$dst" ]]; then
+      printf "  ${YELLOW}new${NC}       %-10s %s\n" "[local]" "$file"
+    fi
+  done
+
+  # Copy-managed files
+  for file in settings.json settings.local.json CLAUDE.md; do
+    local dst="${CLAUDE_DIR}/${file}"
+    if [[ -f "$dst" ]] && [[ ! -L "$dst" ]]; then
+      local cur rec
+      cur=$(file_checksum "$dst")
+      rec=$(manifest_get "$file" "checksum")
+      if [[ -z "$rec" ]]; then
+        printf "  ${YELLOW}untracked${NC} %-10s %s\n" "" "$file"
+      elif [[ "$cur" == "$rec" ]]; then
+        local src_label
+        src_label=$(manifest_get "$file" "source")
+        printf "  ${GREEN}synced${NC}    %-10s %s\n" "[${src_label}]" "$file"
+      else
+        printf "  ${RED}modified${NC}  %-10s %s  (run acs capture)\n" "" "$file"
+      fi
+    fi
+  done
+  echo ""
+
+  # Git info
+  if git -C "$CONFIG_DIR" rev-parse --git-dir &>/dev/null; then
+    local branch dirty="" remote_status=""
+    branch=$(git -C "$CONFIG_DIR" branch --show-current 2>/dev/null || echo "detached")
+    if ! git -C "$CONFIG_DIR" diff --quiet 2>/dev/null || ! git -C "$CONFIG_DIR" diff --cached --quiet 2>/dev/null; then
+      dirty=" (uncommitted changes)"
+    fi
+    if git -C "$CONFIG_DIR" remote get-url origin &>/dev/null 2>&1; then
+      local ahead behind
+      ahead=$(git -C "$CONFIG_DIR" rev-list --count @{u}..HEAD 2>/dev/null || echo "?")
+      behind=$(git -C "$CONFIG_DIR" rev-list --count HEAD..@{u} 2>/dev/null || echo "?")
+      [[ "$ahead" != "?" && "$behind" != "?" ]] && {
+        [[ "$ahead" -gt 0 ]] && [[ "$behind" -gt 0 ]] && remote_status=" [ahead ${ahead}, behind ${behind}]"
+        [[ "$ahead" -gt 0 ]] && [[ "$behind" -eq 0 ]] && remote_status=" [ahead ${ahead}]"
+        [[ "$ahead" -eq 0 ]] && [[ "$behind" -gt 0 ]] && remote_status=" [behind ${behind}]"
+      }
+    fi
+    printf "  ${BOLD}git:${NC} ${branch}${dirty}${remote_status}\n"
+  fi
+}
+
+# ================================================================
+# COMMAND: push
+# ================================================================
+
+cmd_push() {
+  require_config_dir
+  cmd_capture "$@"
+
+  cd "$CONFIG_DIR"
+  if git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null && [[ -z "$(git ls-files --others --exclude-standard 2>/dev/null)" ]]; then
+    log_info "No changes to push."
+    return 0
+  fi
+
+  git add -A
+  local profile msg
+  profile=$(get_active_profile)
+  msg="sync: capture config changes $(date +%Y-%m-%d)"
+  [[ -n "$profile" ]] && msg="sync(${profile}): capture config changes $(date +%Y-%m-%d)"
+  git commit -m "$msg"
+
+  if git remote get-url origin &>/dev/null 2>&1; then
+    log_info "Pushing..."
+    git push
+    log_success "Pushed."
+  else
+    log_success "Committed. (No remote — skipping push.)"
+  fi
+}
+
+# ================================================================
+# COMMAND: pull
+# ================================================================
+
+cmd_pull() {
+  require_config_dir
+  if ! git -C "$CONFIG_DIR" remote get-url origin &>/dev/null 2>&1; then
+    log_error "No git remote configured."
+    exit 1
+  fi
+
+  log_info "Pulling..."
+  git -C "$CONFIG_DIR" pull --ff-only || { log_error "Pull failed (not fast-forward)."; exit 1; }
+
+  local profile
+  profile=$(get_active_profile)
+  cmd_install ${profile:+"$profile"}
+}
+
+# ================================================================
+# COMMAND: diff
+# ================================================================
+
+cmd_diff() {
+  cmd_capture --dry-run
+}
+
+# ================================================================
+# COMMAND: help
+# ================================================================
+
+cmd_help() {
+  cat << 'HELP'
+acs — agent-config-sync
+
+Sync Claude Code configuration across machines and accounts.
+
+Usage: acs <command> [options]
+
+Commands:
+  init <dir> [profile]    Create a new config repo
+  bootstrap [profile]     Import existing ~/.claude/ config into the repo
+  install [profile]       Install config from repo → ~/.claude/
+  capture [--to-profile]  Reverse sync: ~/.claude/ → repo
+  status                  Show sync status of all artifacts
+  push                    Capture + git commit + push
+  pull                    Git pull + re-install
+  diff                    Preview what capture would do
+  help                    Show this help
+  version                 Show version
+
+Options:
+  --dry-run               Preview without making changes (install, capture)
+  --force                 Overwrite files with local modifications (install)
+  --to-base               Save new artifacts to base/ (capture, default)
+  --to-profile            Save new artifacts to active profile (capture)
+  --dir <path>            Use specific config directory
+
+Environment:
+  ACS_CONFIG_DIR          Default config directory path
+
+HELP
+}
+
+# ================================================================
+# MAIN DISPATCH
+# ================================================================
+
+# Parse global flags
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dir)
+      CONFIG_DIR="$2"
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+COMMAND="${1:-help}"
+shift 2>/dev/null || true
+
+case "$COMMAND" in
+  init)      cmd_init "$@" ;;
+  bootstrap) cmd_bootstrap "$@" ;;
+  install)   cmd_install "$@" ;;
+  capture)   cmd_capture "$@" ;;
+  status)    cmd_status "$@" ;;
+  push)      cmd_push "$@" ;;
+  pull)      cmd_pull "$@" ;;
+  diff)      cmd_diff "$@" ;;
+  help|-h|--help) cmd_help ;;
+  version|-v|--version) echo "acs ${VERSION}" ;;
+  *)
+    log_error "Unknown command: ${COMMAND}"
+    cmd_help
+    exit 1
+    ;;
+esac

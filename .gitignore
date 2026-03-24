@@ -1,0 +1,17 @@
+# Machine-specific state
+.profile
+.state/
+
+# Backup files
+*.local-backup
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
+
+# Claude Code project data (auto-created)
+.claude/
