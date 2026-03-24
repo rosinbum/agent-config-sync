@@ -165,6 +165,121 @@ with open('${mf}', 'w') as f:
 "
 }
 
+# --- JSON deep-merge (for settings) ---
+
+# Deep merge base + overlay JSON. Arrays concatenate+dedup, objects recurse, overlay wins on scalars.
+deep_merge_json() {
+  local base_file="$1" overlay_file="$2"
+  ACS_A="$base_file" ACS_B="$overlay_file" /usr/bin/python3 << 'PYEOF'
+import json, os
+
+def deep_merge(base, overlay):
+    result = dict(base)
+    for key, val in overlay.items():
+        if key in result:
+            if isinstance(result[key], dict) and isinstance(val, dict):
+                result[key] = deep_merge(result[key], val)
+            elif isinstance(result[key], list) and isinstance(val, list):
+                seen = set()
+                merged = []
+                for item in result[key] + val:
+                    s = json.dumps(item, sort_keys=True) if not isinstance(item, str) else item
+                    if s not in seen:
+                        seen.add(s)
+                        merged.append(item)
+                result[key] = merged
+            else:
+                result[key] = val
+        else:
+            result[key] = val
+    return result
+
+with open(os.environ['ACS_A']) as f:
+    b = json.load(f)
+with open(os.environ['ACS_B']) as f:
+    o = json.load(f)
+print(json.dumps(deep_merge(b, o), indent=2))
+PYEOF
+}
+
+# Compute delta: keys/values in merged that differ from base.
+# Returns empty string if no difference.
+compute_settings_delta() {
+  local base_file="$1" merged_file="$2"
+  ACS_A="$base_file" ACS_B="$merged_file" /usr/bin/python3 << 'PYEOF'
+import json, os
+
+def compute_delta(base, merged):
+    delta = {}
+    for key, val in merged.items():
+        if key not in base:
+            delta[key] = val
+        elif isinstance(val, dict) and isinstance(base[key], dict):
+            sub = compute_delta(base[key], val)
+            if sub:
+                delta[key] = sub
+        elif isinstance(val, list) and isinstance(base[key], list):
+            extra = [x for x in val if x not in base[key]]
+            if extra:
+                delta[key] = extra
+        elif val != base[key]:
+            delta[key] = val
+    return delta
+
+with open(os.environ['ACS_A']) as f:
+    b = json.load(f)
+with open(os.environ['ACS_B']) as f:
+    m = json.load(f)
+delta = compute_delta(b, m)
+if delta:
+    print(json.dumps(delta, indent=2))
+PYEOF
+}
+
+# Compare two JSON files and print a human-readable diff of differing keys
+diff_json() {
+  local file_a="$1" file_b="$2" label_a="${3:-A}" label_b="${4:-B}"
+  ACS_A="$file_a" ACS_B="$file_b" ACS_LA="$label_a" ACS_LB="$label_b" /usr/bin/python3 << 'PYEOF'
+import json, os
+
+def flatten(obj, prefix=""):
+    items = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                items.update(flatten(v, p))
+            else:
+                items[p] = v
+    else:
+        items[prefix] = obj
+    return items
+
+with open(os.environ['ACS_A']) as f:
+    a = json.load(f)
+with open(os.environ['ACS_B']) as f:
+    b = json.load(f)
+
+fa, fb = flatten(a), flatten(b)
+all_keys = sorted(set(list(fa.keys()) + list(fb.keys())))
+la, lb = os.environ['ACS_LA'], os.environ['ACS_LB']
+
+for key in all_keys:
+    if key in fa and key not in fb:
+        val = json.dumps(fa[key]) if not isinstance(fa[key], str) else fa[key]
+        print(f"  only in {la}: {key} = {val}")
+    elif key not in fa and key in fb:
+        val = json.dumps(fb[key]) if not isinstance(fb[key], str) else fb[key]
+        print(f"  only in {lb}: {key} = {val}")
+    elif fa[key] != fb[key]:
+        va = json.dumps(fa[key]) if not isinstance(fa[key], str) else fa[key]
+        vb = json.dumps(fb[key]) if not isinstance(fb[key], str) else fb[key]
+        print(f"  differs: {key}")
+        print(f"    {la}: {va}")
+        print(f"    {lb}: {vb}")
+PYEOF
+}
+
 # --- Backup ---
 
 backup_file() {
@@ -349,17 +464,6 @@ cmd_bootstrap() {
     log_success "Imported settings.json → base/"
   fi
 
-  # settings.local.json → profile
-  if [[ -f "${CLAUDE_DIR}/settings.local.json" ]]; then
-    if [[ -n "$profile" ]]; then
-      scrub_paths "$(cat "${CLAUDE_DIR}/settings.local.json")" > "${CONFIG_DIR}/profiles/${profile}/settings.local.json"
-      echo "" >> "${CONFIG_DIR}/profiles/${profile}/settings.local.json"
-      log_success "Imported settings.local.json → profiles/${profile}/"
-    else
-      log_warn "settings.local.json exists but no profile specified — skipping"
-    fi
-  fi
-
   # CLAUDE.md
   if [[ -f "${CLAUDE_DIR}/CLAUDE.md" ]]; then
     scrub_paths "$(cat "${CLAUDE_DIR}/CLAUDE.md")" > "${CONFIG_DIR}/base/CLAUDE.md"
@@ -463,7 +567,6 @@ cmd_install() {
       fi
     done
 
-    [[ -f "${CLAUDE_DIR}/settings.local.json" ]] && rm "${CLAUDE_DIR}/settings.local.json"
   fi
 
   # Symlink single files from base/
@@ -489,9 +592,60 @@ cmd_install() {
     done < <(find "$src_dir" -type f -print0 2>/dev/null)
   done
 
-  # settings.json (copy with path expansion)
+  # settings.json (deep-merge base + profile, expand paths, write copy)
   log_header "Settings"
-  install_copy "${CONFIG_DIR}/base/settings.json" "${CLAUDE_DIR}/settings.json" "settings.json" "base" "$dry_run" "$force"
+  local settings_base="${CONFIG_DIR}/base/settings.json"
+  local settings_dst="${CLAUDE_DIR}/settings.json"
+  if [[ -f "$settings_base" ]]; then
+    local settings_profile=""
+    [[ -n "$profile_dir" ]] && settings_profile="${profile_dir}/settings.json"
+
+    # Build merged settings in a temp file
+    local tmp_merged
+    tmp_merged=$(mktemp)
+    if [[ -n "$settings_profile" ]] && [[ -f "$settings_profile" ]]; then
+      # Expand paths in both, merge, write
+      local tmp_base tmp_overlay
+      tmp_base=$(mktemp)
+      tmp_overlay=$(mktemp)
+      expand_paths "$(cat "$settings_base")" > "$tmp_base"
+      expand_paths "$(cat "$settings_profile")" > "$tmp_overlay"
+      deep_merge_json "$tmp_base" "$tmp_overlay" > "$tmp_merged"
+      rm "$tmp_base" "$tmp_overlay"
+      log_info "Merging: base + profile settings"
+    else
+      expand_paths "$(cat "$settings_base")" > "$tmp_merged"
+    fi
+
+    if [[ "$dry_run" == "true" ]]; then
+      if [[ -f "$settings_dst" ]] && diff -q "$settings_dst" "$tmp_merged" &>/dev/null; then
+        log_success "[dry-run] settings.json is up to date"
+      else
+        log_warn "[dry-run] Would update settings.json"
+      fi
+      rm "$tmp_merged"
+    else
+      if [[ -f "$settings_dst" ]] && [[ ! -L "$settings_dst" ]]; then
+        local cur_cs rec_cs
+        cur_cs=$(file_checksum "$settings_dst")
+        rec_cs=$(manifest_get "settings.json" "checksum")
+        if [[ -n "$rec_cs" ]] && [[ "$cur_cs" != "$rec_cs" ]] && [[ "$force" != "true" ]]; then
+          log_warn "settings.json has local changes. Run 'acs capture' first, or use --force."
+          rm "$tmp_merged"
+        else
+          backup_file "$settings_dst"
+          mv "$tmp_merged" "$settings_dst"
+          manifest_set "settings.json" "merged" "copy" "$(file_checksum "$settings_dst")"
+          log_success "Installed settings.json"
+        fi
+      else
+        [[ -L "$settings_dst" ]] && rm "$settings_dst"
+        mv "$tmp_merged" "$settings_dst"
+        manifest_set "settings.json" "merged" "copy" "$(file_checksum "$settings_dst")"
+        log_success "Installed settings.json"
+      fi
+    fi
+  fi
 
   # CLAUDE.md (concatenation of base + profile)
   local claude_md_base="${CONFIG_DIR}/base/CLAUDE.md"
@@ -537,10 +691,8 @@ $(expand_paths "$(cat "${profile_dir}/CLAUDE.md")")"
     fi
   fi
 
-  # Profile overlays
+  # Profile overlays (commands, skills, agents, rules — settings already merged above)
   if [[ -n "$profile" ]] && [[ -n "$profile_dir" ]]; then
-    install_copy "${profile_dir}/settings.local.json" "${CLAUDE_DIR}/settings.local.json" "settings.local.json" "profile:${profile}" "$dry_run" "$force"
-
     for dir in "${SYMLINK_DIRS[@]}"; do
       local p_src="${profile_dir}/${dir}"
       [[ ! -d "$p_src" ]] && continue
@@ -610,7 +762,7 @@ cmd_capture() {
 
   log_header "Scanning ~/.claude/ for changes"
 
-  # 1. settings.json
+  # 1. settings.json — decompose into base + profile delta
   local sdst="${CLAUDE_DIR}/settings.json"
   if [[ -f "$sdst" ]] && [[ ! -L "$sdst" ]]; then
     local cur rec
@@ -622,49 +774,38 @@ cmd_capture() {
         log_warn "[dry-run] settings.json modified"
       else
         log_info "Capturing settings.json..."
-        scrub_paths "$(cat "$sdst")" > "${CONFIG_DIR}/base/settings.json"
-        echo "" >> "${CONFIG_DIR}/base/settings.json"
-        manifest_set "settings.json" "base" "copy" "$cur"
-        log_success "Captured settings.json → base/"
+
+        # Scrub current settings to a temp file
+        local tmp_current tmp_base_expanded
+        tmp_current=$(mktemp)
+        scrub_paths "$(cat "$sdst")" > "$tmp_current"
+
+        if [[ -n "$profile" ]] && [[ -f "${CONFIG_DIR}/base/settings.json" ]]; then
+          # Compute delta against base → profile settings
+          local delta
+          delta=$(compute_settings_delta "${CONFIG_DIR}/base/settings.json" "$tmp_current")
+          if [[ -n "$delta" ]]; then
+            local pdir
+            pdir=$(get_profile_dir "$profile")
+            mkdir -p "$pdir"
+            printf '%s\n' "$delta" > "${pdir}/settings.json"
+            log_success "Captured profile settings delta → profiles/${profile}/settings.json"
+          fi
+          # Base stays as-is (edit manually in repo to change base)
+        else
+          # No profile or no base yet — save everything to base
+          mv "$tmp_current" "${CONFIG_DIR}/base/settings.json"
+          log_success "Captured settings.json → base/"
+          tmp_current=""
+        fi
+
+        [[ -n "${tmp_current:-}" ]] && rm -f "$tmp_current"
+        manifest_set "settings.json" "merged" "copy" "$cur"
       fi
     fi
   fi
 
-  # 2. settings.local.json
-  if [[ -n "$profile" ]]; then
-    local sldst="${CLAUDE_DIR}/settings.local.json"
-    local slsrc="${CONFIG_DIR}/profiles/${profile}/settings.local.json"
-    if [[ -f "$sldst" ]] && [[ ! -L "$sldst" ]]; then
-      local cur rec
-      cur=$(file_checksum "$sldst")
-      rec=$(manifest_get "settings.local.json" "checksum")
-      if [[ -n "$rec" ]] && [[ "$cur" != "$rec" ]]; then
-        changes=1
-        if [[ "$dry_run" == "true" ]]; then
-          log_warn "[dry-run] settings.local.json modified"
-        else
-          mkdir -p "$(dirname "$slsrc")"
-          scrub_paths "$(cat "$sldst")" > "$slsrc"
-          echo "" >> "$slsrc"
-          manifest_set "settings.local.json" "profile:${profile}" "copy" "$cur"
-          log_success "Captured settings.local.json → profiles/${profile}/"
-        fi
-      elif [[ -z "$rec" ]] && [[ ! -f "$slsrc" ]]; then
-        changes=1
-        if [[ "$dry_run" == "true" ]]; then
-          log_warn "[dry-run] New settings.local.json detected"
-        else
-          mkdir -p "$(dirname "$slsrc")"
-          scrub_paths "$(cat "$sldst")" > "$slsrc"
-          echo "" >> "$slsrc"
-          manifest_set "settings.local.json" "profile:${profile}" "copy" "$(file_checksum "$sldst")"
-          log_success "Captured new settings.local.json → profiles/${profile}/"
-        fi
-      fi
-    fi
-  fi
-
-  # 3. New artifacts in symlinked directories
+  # 2. New artifacts in symlinked directories
   for dir in "${SYMLINK_DIRS[@]}"; do
     local dstd="${CLAUDE_DIR}/${dir}"
     [[ ! -d "$dstd" ]] && continue
@@ -889,7 +1030,7 @@ cmd_status() {
   done
 
   # Copy-managed files
-  for file in settings.json settings.local.json CLAUDE.md; do
+  for file in settings.json CLAUDE.md; do
     local dst="${CLAUDE_DIR}/${file}"
     if [[ -f "$dst" ]] && [[ ! -L "$dst" ]]; then
       local cur rec
@@ -987,6 +1128,196 @@ cmd_diff() {
 }
 
 # ================================================================
+# COMMAND: merge (second-machine bootstrap)
+# ================================================================
+
+cmd_merge() {
+  require_config_dir
+  local profile="${1:-}"
+
+  if [[ -z "$profile" ]]; then
+    echo "Usage: acs merge <profile>"
+    echo ""
+    echo "Compare this machine's ~/.claude/ against the repo and sort"
+    echo "differences into base (shared) or profile (machine-specific)."
+    echo "Run this on your second machine after cloning the config repo."
+    exit 1
+  fi
+
+  local profile_dir
+  profile_dir=$(get_profile_dir "$profile")
+  mkdir -p "${profile_dir}"/{commands,skills,agents,rules}
+
+  [[ ! -d "$CLAUDE_DIR" ]] && { log_error "~/.claude/ does not exist."; exit 1; }
+
+  log_header "Comparing ~/.claude/ against repo (profile: ${profile})"
+
+  # --- Settings diff ---
+  local settings_base="${CONFIG_DIR}/base/settings.json"
+  local settings_local="${CLAUDE_DIR}/settings.json"
+  if [[ -f "$settings_local" ]] && [[ -f "$settings_base" ]]; then
+    log_header "Settings"
+    # Scrub local to temp for comparison
+    local tmp_local
+    tmp_local=$(mktemp)
+    scrub_paths "$(cat "$settings_local")" > "$tmp_local"
+
+    local delta
+    delta=$(compute_settings_delta "$settings_base" "$tmp_local")
+
+    if [[ -n "$delta" ]]; then
+      echo "  Settings keys on this machine that differ from base:"
+      echo ""
+      diff_json "$settings_base" "$tmp_local" "base" "this machine"
+      echo ""
+
+      printf "  Save differences to ${CYAN}profiles/${profile}/settings.json${NC}? [Y/n] "
+      read -r answer
+      if [[ "${answer:-Y}" =~ ^[Yy]$ ]] || [[ -z "$answer" ]]; then
+        printf '%s\n' "$delta" > "${profile_dir}/settings.json"
+        log_success "Saved settings delta → profiles/${profile}/settings.json"
+      else
+        log_info "Skipped settings delta"
+      fi
+
+      printf "  Promote any of these to base (shared across all machines)? [y/N] "
+      read -r answer
+      if [[ "${answer:-N}" =~ ^[Yy]$ ]]; then
+        log_info "Merging all into base..."
+        # Deep-merge into base
+        deep_merge_json "$settings_base" "$tmp_local" > "${settings_base}.tmp"
+        mv "${settings_base}.tmp" "$settings_base"
+        # Recompute delta (should be empty now)
+        rm -f "${profile_dir}/settings.json"
+        log_success "Merged into base/settings.json"
+      fi
+    else
+      log_success "Settings match base — no differences"
+    fi
+    rm -f "$tmp_local"
+  elif [[ -f "$settings_local" ]] && [[ ! -f "$settings_base" ]]; then
+    log_info "No base/settings.json yet. Importing from this machine."
+    scrub_paths "$(cat "$settings_local")" > "$settings_base"
+    echo "" >> "$settings_base"
+    log_success "Imported settings.json → base/"
+  fi
+
+  # --- CLAUDE.md ---
+  local claude_base="${CONFIG_DIR}/base/CLAUDE.md"
+  local claude_local="${CLAUDE_DIR}/CLAUDE.md"
+  if [[ -f "$claude_local" ]] && [[ -f "$claude_base" ]]; then
+    local tmp_local
+    tmp_local=$(mktemp)
+    scrub_paths "$(cat "$claude_local")" > "$tmp_local"
+    if ! diff -q "$claude_base" "$tmp_local" &>/dev/null; then
+      log_header "CLAUDE.md"
+      echo "  CLAUDE.md differs from base. Diff:"
+      diff --color=auto "$claude_base" "$tmp_local" || true
+      echo ""
+      printf "  Save this machine's additions to ${CYAN}profiles/${profile}/CLAUDE.md${NC}? [Y/n] "
+      read -r answer
+      if [[ "${answer:-Y}" =~ ^[Yy]$ ]] || [[ -z "$answer" ]]; then
+        cp "$tmp_local" "${profile_dir}/CLAUDE.md"
+        log_success "Saved CLAUDE.md → profiles/${profile}/"
+      fi
+    fi
+    rm -f "$tmp_local"
+  elif [[ -f "$claude_local" ]] && [[ ! -f "$claude_base" ]]; then
+    scrub_paths "$(cat "$claude_local")" > "$claude_base"
+    log_success "Imported CLAUDE.md → base/"
+  fi
+
+  # --- Directory artifacts (commands, skills, agents, rules) ---
+  for dir in "${SYMLINK_DIRS[@]}"; do
+    local src_dir="${CLAUDE_DIR}/${dir}"
+    local base_dir="${CONFIG_DIR}/base/${dir}"
+    [[ ! -d "$src_dir" ]] && continue
+
+    local has_diff=false
+    while IFS= read -r -d '' file; do
+      local rel="${file#${src_dir}/}"
+      [[ "$rel" == .* ]] && continue
+
+      local base_file="${base_dir}/${rel}"
+      local prof_file="${profile_dir}/${dir}/${rel}"
+
+      if [[ -f "$base_file" ]]; then
+        # Exists in base — check if different
+        local tmp_scrubbed
+        tmp_scrubbed=$(mktemp)
+        scrub_paths "$(cat "$file")" > "$tmp_scrubbed"
+        if ! diff -q "$base_file" "$tmp_scrubbed" &>/dev/null; then
+          [[ "$has_diff" == "false" ]] && log_header "${dir}/"
+          has_diff=true
+          printf "  ${YELLOW}differs${NC}  ${dir}/${rel}\n"
+          printf "    Save this machine's version to profile? [y/N] "
+          read -r answer
+          if [[ "${answer:-N}" =~ ^[Yy]$ ]]; then
+            mkdir -p "$(dirname "$prof_file")"
+            cp "$tmp_scrubbed" "$prof_file"
+            log_success "  → profiles/${profile}/${dir}/${rel}"
+          fi
+        fi
+        rm -f "$tmp_scrubbed"
+      else
+        # New artifact not in base
+        [[ "$has_diff" == "false" ]] && log_header "${dir}/"
+        has_diff=true
+        printf "  ${CYAN}new${NC}      ${dir}/${rel}\n"
+        printf "    Add to [b]ase (shared) or [p]rofile (${profile}-only)? [b/p] "
+        read -r answer
+        local dest_dir
+        if [[ "${answer:-b}" =~ ^[Pp]$ ]]; then
+          dest_dir="${profile_dir}/${dir}"
+        else
+          dest_dir="${base_dir}"
+        fi
+        mkdir -p "$(dirname "${dest_dir}/${rel}")"
+        cp "$file" "${dest_dir}/${rel}"
+        scrub_file "${dest_dir}/${rel}"
+        log_success "  → $(basename "$(dirname "$dest_dir")")/${dir}/${rel}"
+      fi
+    done < <(find "$src_dir" -type f -print0 2>/dev/null)
+  done
+
+  # --- Single files ---
+  for file in "${SYMLINK_FILES[@]}"; do
+    local src="${CLAUDE_DIR}/${file}"
+    local base_f="${CONFIG_DIR}/base/${file}"
+    [[ ! -f "$src" ]] && continue
+
+    if [[ -f "$base_f" ]]; then
+      local tmp_scrubbed
+      tmp_scrubbed=$(mktemp)
+      scrub_paths "$(cat "$src")" > "$tmp_scrubbed"
+      if ! diff -q "$base_f" "$tmp_scrubbed" &>/dev/null; then
+        log_header "File: ${file}"
+        printf "  ${YELLOW}differs${NC} from base\n"
+        printf "    Save to profile? [y/N] "
+        read -r answer
+        if [[ "${answer:-N}" =~ ^[Yy]$ ]]; then
+          cp "$tmp_scrubbed" "${profile_dir}/${file}"
+          log_success "  → profiles/${profile}/${file}"
+        fi
+      fi
+      rm -f "$tmp_scrubbed"
+    else
+      cp "$src" "${CONFIG_DIR}/base/${file}"
+      scrub_file "${CONFIG_DIR}/base/${file}"
+      log_success "Imported ${file} → base/"
+    fi
+  done
+
+  log_header "Merge complete"
+  echo ""
+  echo "Next steps:"
+  echo "  1. Review: git diff"
+  echo "  2. Install: acs install ${profile}"
+  echo "  3. Commit: git add -A && git commit -m 'add ${profile} profile'"
+  echo "  4. Push: git push"
+}
+
+# ================================================================
 # COMMAND: help
 # ================================================================
 
@@ -1000,7 +1331,8 @@ Usage: acs <command> [options]
 
 Commands:
   init <dir> [profile]    Create a new config repo
-  bootstrap [profile]     Import existing ~/.claude/ config into the repo
+  bootstrap [profile]     Import existing ~/.claude/ config (first machine)
+  merge <profile>         Compare + sort diffs into base/profile (second machine)
   install [profile]       Install config from repo → ~/.claude/
   capture [--to-profile]  Reverse sync: ~/.claude/ → repo
   status                  Show sync status of all artifacts
@@ -1046,6 +1378,7 @@ shift 2>/dev/null || true
 case "$COMMAND" in
   init)      cmd_init "$@" ;;
   bootstrap) cmd_bootstrap "$@" ;;
+  merge)     cmd_merge "$@" ;;
   install)   cmd_install "$@" ;;
   capture)   cmd_capture "$@" ;;
   status)    cmd_status "$@" ;;

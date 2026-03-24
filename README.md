@@ -33,16 +33,16 @@ your-claude-config/       ← your private repo (created by `acs init`)
     statusline-command.sh
   profiles/
     personal/             ← personal-only overrides
-      settings.local.json
+      settings.json
       commands/
     work/                 ← work-only overrides
-      settings.local.json
+      settings.json
       commands/
 ```
 
 Portable artifacts (commands, skills, etc.) are **symlinked** into `~/.claude/`, so edits in either location are the same file. Non-portable artifacts (settings with absolute paths) are **copied** with automatic path scrubbing (`/Users/you` ↔ `{{ HOME }}`).
 
-Claude Code natively deep-merges `settings.local.json` on top of `settings.json`, so profile-specific settings just work.
+Claude Code natively deep-merges `settings.json` on top of `settings.json`, so profile-specific settings just work.
 
 ## Install
 
@@ -92,27 +92,25 @@ git push -u origin main
 git clone git@github.com:YOU/my-claude-config.git
 cd my-claude-config
 
-# Create the work profile
-mkdir -p profiles/work/{commands,skills,agents,rules}
-
-# Add work-specific settings overrides
-cat > profiles/work/settings.local.json << 'EOF'
-{
-  "permissions": {
-    "allow": [
-      "Bash(docker *)",
-      "Bash(aws *)"
-    ]
-  }
-}
-EOF
+# Interactive merge: compare this machine's config against the repo,
+# sort each difference into base (shared) or profile (work-only)
+acs merge work
 
 # Install with the work profile
 acs install work
 
 # Verify
 acs status
+
+# Commit the new profile
+git add -A && git commit -m "add work profile"
+git push
 ```
+
+`acs merge` walks through each difference interactively:
+- **Settings**: shows key-level diff, saves differences to profile
+- **Commands/skills**: for each new artifact, asks base (shared) or profile (work-only)
+- **Existing artifacts that differ**: asks whether to save this machine's version to profile
 
 ## Commands
 
@@ -126,12 +124,26 @@ acs init ~/src/my-claude-config personal
 
 ### `acs bootstrap [profile]`
 
-One-time import of your existing `~/.claude/` config. Scrubs all absolute paths. Run from inside the config repo.
+One-time import of your existing `~/.claude/` config. Scrubs all absolute paths. Run from inside the config repo. Use this on your **first** machine.
 
 ```bash
 cd ~/src/my-claude-config
 acs bootstrap personal
 ```
+
+### `acs merge <profile>`
+
+Interactive merge for your **second** machine. Compares this machine's `~/.claude/` against the repo and helps sort differences into base (shared) or profile (machine-specific).
+
+```bash
+cd ~/src/my-claude-config
+acs merge work
+```
+
+For each difference it finds:
+- **Settings**: shows a key-level diff, offers to save differences as the profile's `settings.json`
+- **New commands/skills/agents/rules**: asks whether each belongs in base or this profile
+- **Files that differ from base**: asks whether to save this machine's version to the profile
 
 ### `acs install [OPTIONS] [profile]`
 
@@ -151,7 +163,7 @@ What it does:
 3. Copies `settings.json` with path expansion (`{{ HOME }}` → `$HOME`)
 4. Concatenates `base/CLAUDE.md` + `profiles/<name>/CLAUDE.md`
 5. Overlays profile-specific artifacts (profile wins on conflicts)
-6. Copies profile `settings.local.json`
+6. Copies profile `settings.json`
 
 ### `acs capture [OPTIONS]`
 
@@ -227,9 +239,8 @@ acs pull                     # git pull + re-install
 | `rules/*.md` | Symlink |
 | `statusline-command.sh` | Symlink |
 | `keybindings.json` | Symlink |
-| `settings.json` | Copy (path-scrubbed) |
-| `settings.local.json` | Copy (per-profile) |
-| `CLAUDE.md` | Copy (base + profile) |
+| `settings.json` | Copy (base + profile deep-merged, path-scrubbed) |
+| `CLAUDE.md` | Copy (base + profile concatenated) |
 
 ### Never Synced
 
@@ -238,7 +249,7 @@ Sessions, history, telemetry, debug logs, project memory, tasks, todos, plans, s
 ## Profile Precedence
 
 - **Commands, skills, agents, rules**: profile wins when same filename exists in base and profile
-- **Settings**: `settings.local.json` is deep-merged on top by Claude Code
+- **Settings**: `base/settings.json` + `profiles/<name>/settings.json` are deep-merged at install time (arrays concatenate + dedup, overlay scalars win)
 - **CLAUDE.md**: both included (concatenated with `<!-- profile: NAME -->` marker)
 
 ## Requirements
